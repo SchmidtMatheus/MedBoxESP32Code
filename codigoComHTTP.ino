@@ -1,5 +1,3 @@
-#include <Fuzzy.h>
-#include <SSD1306.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -7,244 +5,219 @@
 #include <DHT.h>
 #include <HTTPClient.h>
 #include <Arduino_JSON.h>
-#include <TimeLib.h>
 
-#define saidaControle 16                  // Define o pino 14 do ESP32 como saída de controle
-#define BUZZ 2                            // Define o pino 2 do ESP32 como o buzzer
-#define tempAD 14                         // Define o pino 13 do ESP32 como entrada do sensor de temperatura
-#define batAD 39                          // Define o pino 39 do ESP32 como entrada do sensor de bateria
-#define INTERVALO_ALIMENTACAO_FILA 15000  // Intervalo de 15 segundos em milissegundos
+// Pin definitions
+#define CONTROL_OUTPUT_PIN 16  // Define GPIO 16 on ESP32 as control output
+#define BUZZER_PIN 2           // Define GPIO 2 on ESP32 as the buzzer pin
+#define TEMP_SENSOR_PIN 14     // Define GPIO 14 on ESP32 as temperature sensor input
+#define BAT_SENSOR_PIN 39      // Define GPIO 39 on ESP32 as battery sensor input
 
-// Tamanho do display OLED (em pixels)
+// Interval for feeding queue (in milliseconds)
+#define POST_INTERVAL 15000
+
+// OLED display size (in pixels)
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-#define ssid "mary"
-#define password "renato37"
+// WiFi credentials
+// #define ssid "Intranet Consultorio"
+// #define password "schmidt@102030"
+// ip: 10.0.0.213
+
+#define ssid "cecinha"
+#define password "04122007"
+// ip: 192.168.101.29
+
+// #define ssid "Ape 14"
+// #define password "534784julia"
+// ip: 192.168.3.148
+
+//#define ssid "matheusWiFi"
+//#define password "teste123"
 
 #define DHTTYPE DHT11
 
-DHT dht(tempAD, DHTTYPE);
+DHT dht(TEMP_SENSOR_PIN, DHTTYPE);
 
 WiFiServer server(80);
 
-Fuzzy *fuzzy = new Fuzzy();
-
-QueueHandle_t filaMonitoramento;
-
-TimerHandle_t timerAlimentacaoFila;
-
-struct DadosMonitoramento {
-  float temperatura;
-  float umidade;
-  String created_at;
+struct MonitoringData {
+  float temperature;
+  float humidity;
 };
 
-float tempMuitoBaixa, tempBaixa, temperaturaInicial, tempAlta, tempMuitoAlta, porcentagemBat, temperatura, humidity;
-bool isConectado = false;
+QueueHandle_t monitoringQueue;
+TimerHandle_t queueFeedTimer;
 
-// Conjuntos fuzzy para temperatura e velocidade do ventilador
-FuzzySet *baixaTemp = new FuzzySet(tempMuitoBaixa, tempBaixa, tempBaixa, temperaturaInicial);     // baixa: será definida dinamicamente
-FuzzySet *mediaTemp = new FuzzySet(tempBaixa, temperaturaInicial, temperaturaInicial, tempAlta);  // media: será definida dinamicamente
-FuzzySet *altaTemp = new FuzzySet(temperaturaInicial, tempAlta, tempAlta, tempMuitoAlta);         // alta: será definida dinamicamente
-FuzzySet *baixaVelocidade = new FuzzySet(0, 30, 30, 50);                                          // baixa: 30%
-FuzzySet *mediaVelocidade = new FuzzySet(40, 60, 60, 80);                                         // média: 60%
-FuzzySet *altaVelocidade = new FuzzySet(70, 90, 90, 100);                                         // alta: 90%
+float batteryPercentage, temperature, humidity, pwm;
+bool isConnected = false;
+unsigned long lastFeedTime = 0, lastBuzzerTime = 0;
+;
 
-// Inicialização do objeto SSD1306
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 void setup() {
-  pinMode(saidaControle, OUTPUT);
-  pinMode(BUZZ, OUTPUT);
-  pinMode(tempAD, INPUT);
-  pinMode(batAD, INPUT);
+  Serial.begin(115200);
+  pinMode(CONTROL_OUTPUT_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TEMP_SENSOR_PIN, INPUT);
+  pinMode(BAT_SENSOR_PIN, INPUT);
 
   dht.begin();
 
   Wire.begin(5, 4);
-  // Inicialização do display OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, false)) {
     Serial.println(F("SSD1306 allocation failed"));
     for (;;)
       ;
   }
-  //Connect to Wi-Fi
+  display.setRotation(2);
+
+  // Connect to Wi-Fi
   WiFi.begin(ssid, password);
 
-  // Start the HTTP server
+  // Start HTTP server
   server.begin();
 
-  // Definição das regras fuzzy
-  definirRegras();
+  ledcAttachPin(CONTROL_OUTPUT_PIN, 0);  // Anexar o pino ao canal 0 do PWM
+  ledcSetup(0, 1000, 8);                 // Canal 0, frequência de 5000 Hz, resolução de 8 bits
 
-  filaMonitoramento = xQueueCreate(10, sizeof(JSONVar));
+  // Create monitoring queue
+  monitoringQueue = xQueueCreate(10, sizeof(MonitoringData));  // Alterado para o tamanho da estrutura MonitoringData
 
-  // Iniciar o timer para alimentar a fila a cada 15 segundos
-  timerAlimentacaoFila = xTimerCreate("timerAlimentacaoFila", pdMS_TO_TICKS(INTERVALO_ALIMENTACAO_FILA), pdTRUE, 0, alimentaFila);
-  xTimerStart(timerAlimentacaoFila, 0);
+  // PID initialization
+  temperature = dht.readTemperature();
+
+  isConnected = (WiFi.status() == WL_CONNECTED);
+  if (isConnected) {
+    getPWMValue();
+  }
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    isConectado = false;
-  } else if (WiFi.status() == WL_CONNECTED) {
-    isConectado = true;
-    processarObjetoJSON();
-    processarFila();
+  // Check WiFi connection
+  isConnected = (WiFi.status() == WL_CONNECTED);
+  if (isConnected) {
+    static unsigned long lastPostTime = 0;
+    if (millis() - lastPostTime >= POST_INTERVAL) {
+      float temperature = dht.readTemperature();
+      if (!isnan(temperature)) { 
+        processAndSendData();
+      }
+      lastPostTime = millis();
+    }
+    getPWMValue();
   }
 
-  temperatura = dht.readTemperature();
-  humidity = dht.readHumidity();
+  // Read temperature
+  temperature = dht.readTemperature();
 
-  float tensaoBat = (analogRead(batAD) / 4095.0) * 3.3;
-  // porcentagemBat = (tensaoBat / 12.0) * 100;  // Calcula a porcentagem da bateria de 12V
-  porcentagemBat = (tensaoBat) / 3.3 * 100;  // Calcula a porcentagem da bateria de 3.3V
+  // Update fan output
+  ledcWrite(0, pwm);
+  Serial.println("pwm: ");
+  Serial.println(pwm);
 
+  batteryPercentage = analogRead(BAT_SENSOR_PIN) / 4095.0 * 100;
 
+  unsigned long currentTime = millis();
+  if (batteryPercentage < 15 && (currentTime - lastBuzzerTime >= 15000)) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(1000);
+    digitalWrite(BUZZER_PIN, LOW);
+    lastBuzzerTime = currentTime;
+  } else if (batteryPercentage < 55 && (currentTime - lastBuzzerTime >= 5000)) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(1000);
+    digitalWrite(BUZZER_PIN, LOW);
+    lastBuzzerTime = currentTime;
+  }
 
-  // Atualiza o valor de entrada da temperatura no sistema fuzzy
-  fuzzy->setInput(1, temperatura);
-  // Executa a fuzzificação
-  fuzzy->fuzzify();
-  // Executa a defuzzificação
-  float velocidade = fuzzy->defuzzify(1);
+  // Display data on OLED
+  displayData();
+  delay(500);
+}
 
-  // Define a velocidade do ventilador
-  analogWrite(saidaControle, velocidade);
-
-  exibirDadosDisplay();
-
-  delay(200);  // Tempo entre medições do sensor (500ms)
-};
-
-void definirConjuntosFuzzy(float temperaturaInicial, float offset) {
-  // Define os limites dos conjuntos fuzzy com base na temperatura inicial
-  tempMuitoBaixa = temperaturaInicial - offset;
-  tempBaixa = temperaturaInicial - (offset / 2);
-  tempAlta = temperaturaInicial + (offset / 2);
-  tempMuitoAlta = temperaturaInicial + offset;
-};
-
-void exibirDadosDisplay() {
-  // Exibe a porcentagem da bateria, a temperatura e o status do WiFi no display OLED
+void displayData() {
   display.clearDisplay();
 
-  display.setTextSize(1);  // Draw 2X-scale text
+  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.println("Temperatura: " + String(temperatura, 1) + "C");
+  display.println("Temperature: " + String(temperature, 1) + "C");
 
-  display.setTextSize(1);  // Draw 2X-scale text
+  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 20);
-  display.println("Bateria: " + String(porcentagemBat) + "%");
+  display.println("PWM: " + String(pwm));
 
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 50);
-  display.println("WiFi: " + String(isConectado ? "Conectado" : "Nao Conectado"));
+  display.println("WiFi: " + String(isConnected ? "Connected" : "Not Connected"));
 
-
-
-  display.display();  // Show initial text
-  delay(100);
+  display.display();
 }
 
-void definirRegras() {
-  // Regra: Se temperatura é baixa, então velocidade é baixa
-  FuzzyRuleAntecedent *ifBaixaTemp = new FuzzyRuleAntecedent();
-  ifBaixaTemp->joinSingle(baixaTemp);
-  FuzzyRuleConsequent *thenBaixaVelocidade = new FuzzyRuleConsequent();
-  thenBaixaVelocidade->addOutput(baixaVelocidade);
-  FuzzyRule *fuzzyRule1 = new FuzzyRule(1, ifBaixaTemp, thenBaixaVelocidade);
-  fuzzy->addFuzzyRule(fuzzyRule1);
-
-  // Regra: Se temperatura é média, então velocidade é média
-  FuzzyRuleAntecedent *ifMediaTemp = new FuzzyRuleAntecedent();
-  ifMediaTemp->joinSingle(mediaTemp);
-  FuzzyRuleConsequent *thenMediaVelocidade = new FuzzyRuleConsequent();
-  thenMediaVelocidade->addOutput(mediaVelocidade);
-  FuzzyRule *fuzzyRule2 = new FuzzyRule(2, ifMediaTemp, thenMediaVelocidade);
-  fuzzy->addFuzzyRule(fuzzyRule2);
-
-  // Regra: Se temperatura é alta, então velocidade é alta
-  FuzzyRuleAntecedent *ifAltaTemp = new FuzzyRuleAntecedent();
-  ifAltaTemp->joinSingle(altaTemp);
-  FuzzyRuleConsequent *thenAltaVelocidade = new FuzzyRuleConsequent();
-  thenAltaVelocidade->addOutput(altaVelocidade);
-  FuzzyRule *fuzzyRule3 = new FuzzyRule(3, ifAltaTemp, thenAltaVelocidade);
-  fuzzy->addFuzzyRule(fuzzyRule3);
-}
-
-void processarObjetoJSON() {
+void getPWMValue() {
   HTTPClient http;
-  WiFiClient client;
 
-  if (http.begin(client, "http://localhost3000/configs/2")) {  // URL do servidor e endpoint
+  float temperatura = dht.readTemperature();
+
+  if (!isnan(temperatura)) {
+    String url = "http://192.168.101.29:3000/fuzzy/" + String(temperatura);
+    http.begin(url);
+
+    // Fazer a solicitação GET
     int httpCode = http.GET();
 
     if (httpCode > 0) {
-      String payload = http.getString();  // Obtém a resposta JSON
-
-      // Decodifica o JSON
-      JSONVar payloadRecebido = JSON.parse(payload);
-
-      // Obtém os valores do JSON
-      float temperatura = atof(JSON.stringify(payloadRecebido["temperatura"]).c_str());  // Converte de String para float
-      float offset = atof(JSON.stringify(payloadRecebido["offset"]).c_str());            // Converte de String para float
-
-      definirConjuntosFuzzy(temperatura, offset);
-    }
-
-    http.end();
-  }
-}
-
-void alimentaFila(TimerHandle_t timer) {
-  // Obter os dados de temperatura e umidade
-  temperatura = dht.readTemperature();
-  humidity = dht.readHumidity();
-
-  // Obter a data e hora atual
-  time_t now = time(nullptr);  // Obter o tempo atual
-  struct tm *timeinfo;
-  timeinfo = localtime(&now);
-  String created_at = String(year()) + "-" + String(month()) + "-" + String(day()) + " " + String(hour()) + ":" + String(minute()) + ":" + String(second());
-
-  // Criar um objeto JSON com os dados de monitoramento
-  JSONVar dadosJSON;
-  dadosJSON["temperatura"] = temperatura;
-  dadosJSON["umidade"] = humidity;
-  dadosJSON["data"] = created_at;
-
-  // Enviar os dados para a fila
-  xQueueSendToBack(filaMonitoramento, &dadosJSON, portMAX_DELAY);
-}
-
-void processarFila() {
-  // Verificar se há conexão Wi-Fi
-  if (WiFi.status() == WL_CONNECTED) {
-    // Loop para processar todos os itens na fila
-    while (uxQueueMessagesWaiting(filaMonitoramento) > 0) {
-      // Obter o próximo item da fila
-      DadosMonitoramento dados;
-      xQueueReceive(filaMonitoramento, &dados, portMAX_DELAY);
-
-      // Criar um objeto JSON com os dados de monitoramento
-      JSONVar dadosJSON;
-      dadosJSON["temperatura"] = dados.temperatura;
-      dadosJSON["umidade"] = dados.umidade;
-      dadosJSON["data"] = dados.created_at;
-
-      // Enviar os dados via POST
-      HTTPClient http;
-      http.begin("http://localhost:3000/registries");
-      http.addHeader("Content-Type", "application/json");
-      int httpCode = http.POST(JSON.stringify(dadosJSON));
-
-      // Liberar recursos
+      String payload = http.getString();
+      pwm = payload.toInt();
+      Serial.print("Valor do PWM recebido: ");
+      Serial.print(pwm);
       http.end();
     }
+  } else {
+    Serial.println("Falha na solicitação HTTP!");
+    pwm = 255;
   }
+  return;
+}
+
+void processAndSendData() {
+  // Get temperature and humidity data
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  // Create a JSON object with monitoring data
+  JSONVar createRegistryDto;
+  char tempStr[6];
+  snprintf(tempStr, sizeof(tempStr), "%.2f", temperature);
+  createRegistryDto["temperature"] = atof(tempStr);
+  createRegistryDto["humidity"] = humidity;
+
+  // Encapsulate createRegistryDto in the monitoringJSON
+  JSONVar monitoringJSON;
+  monitoringJSON["createRegistryDto"] = createRegistryDto;
+
+  // Convert JSON object to String to send
+  String jsonString = JSON.stringify(monitoringJSON);
+  Serial.println(jsonString);
+
+  // Send data via POST
+  HTTPClient http;
+  http.begin("http://192.168.101.29:3000/registries");
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.POST(jsonString);
+
+  // Check the returning http code
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.println(httpCode);
+    Serial.println(payload);
+  } else {
+    Serial.println("Error on HTTP request");
+  }
+
+  http.end();
 }
