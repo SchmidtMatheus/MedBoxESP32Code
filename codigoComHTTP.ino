@@ -19,21 +19,8 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-// WiFi credentials
-// #define ssid "Intranet Consultorio"
-// #define password "schmidt@102030"
-// ip: 10.0.0.213
-
-#define ssid "cecinha"
-#define password "04122007"
-// ip: 192.168.101.29
-
-// #define ssid "Ape 14"
-// #define password "534784julia"
-// ip: 192.168.3.148
-
-//#define ssid "matheusWiFi"
-//#define password "teste123"
+#define ssid "matheusWiFi"
+#define password "teste123"
 
 #define DHTTYPE DHT11
 
